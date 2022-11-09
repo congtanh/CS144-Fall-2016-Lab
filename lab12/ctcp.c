@@ -16,48 +16,11 @@
 #include "ctcp_sys.h"
 #include "ctcp_utils.h"
 
-/**
- * ctcp_state child structs
- */
+#define MAX_BUFF_SIZE MAX_SEG_DATA_SIZE
+#define SEGMENT_HDR_SIZE sizeof(ctcp_segment_t)
 
-typedef struct {
-  uint32_t last_ackno_rxed;
-  bool has_my_FIN_been_sent;  /* Todo - not sure if necessary */
-  bool has_my_FIN_been_acked; 
-  bool has_EOF_been_read;
+char buffer[MAX_BUFF_SIZE];
 
-  /* This should be the index of the LAST byte we have read from conn_input(). */
-  uint32_t last_seqno_read;
-
-  /* If the newest segment we've sent (not including rexmits) has a sequence
-  number of 1000 and a length of 10 bytes, then last_seqno_sent should be 1010
-  i.e., it's the sequence number of the last byte we've sent. */
-  uint32_t last_seqno_sent;
-
-  /* If this is too old, we can send a keepalive. */
-  long timestamp_of_last_send;
-
-  /* Make this point to a metadata wrapper:
-      --> wrapped_segment:
-              - num xmits
-              - timestamp of last send
-              - ctcp_segment struct  */
-  linked_list_t *wrapped_unacked_segments; 
-} tx_state_t;
-
-typedef struct {
-  uint32_t last_seqno_accepted; /* Use this to generate ackno's when sending */
-  bool has_FIN_been_rxed;
-
-  /* This should be a linked list of ctcp_segment_t*'s. */
-  linked_list_t *segments_to_output;
-} rx_state_t;
-
-typedef struct {
-  uint32_t num_xmits; /* Number of send attempts, include retransmission. */
-  long timestamp_of_last_send;
-  ctcp_segment_t ctcp_segment;
-} wrapped_ctcp_segment_t;
 
 /**
  * Connection state.
@@ -74,10 +37,18 @@ struct ctcp_state {
   conn_t *conn;             /* Connection object -- needed in order to figure
                                out destination when sending */
 
+  linked_list_t *segments; /* Linked list of segments sent to this connection.
+                            It may be useful to have multiple linked lists
+                            for unacknowledged segments, segments that
+                            haven't been sent, etc. Lab 1 uses the
+                            stop-and-wait protocol and therefore does not
+                            necessarily need a linked list. You may remove
+                            this if this is the case for you */
+
   /* FIXME: Add other needed fields. */
-  ctcp_config_t ctcp_config;
-  tx_state_t tx_state;
-  rx_state_t rx_state;
+  uint32_t seqno;              /* Current sequence number */
+  uint32_t next_seqno;         /* Sequence number of next segment to send */
+  uint32_t ackno;              /* Current ack number */
 };
 
 /**
@@ -88,6 +59,46 @@ static ctcp_state_t *state_list;
 
 /* FIXME: Feel free to add as many helper functions as needed. Don't repeat
           code! Helper functions make the code clearer and cleaner. */
+
+/**
+ * The two following funtions convert the byte-order of segments
+ */
+static void segment_hton(ctcp_segment_t *segment)
+{
+  segment->seqno = htonl(segment->seqno);
+  segment->ackno = htonl(segment->ackno);
+  segment->len = htons(segment->len);
+  segment->flags = htonl(segment->flags);
+  segment->window = htons(segment->window);
+  /* cksum is already in network byte order - README said */
+
+}
+
+static void segment_ntoh(ctcp_segment_t *segment)
+{
+  segment->seqno = ntohl(segment->seqno);
+  segment->ackno = ntohl(segment->ackno);
+  segment->len = ntohs(segment->len);
+  segment->flags = ntohl(segment->flags);
+  segment->window = ntohs(segment->window);
+}
+
+int16_t segment_send(ctcp_state_t *state,int32_t flags, int32_t len, char* data)
+{
+  ctcp_segment_t *segment = calloc(len,1);
+  segment->len = len;
+  segment->seqno = state->seqno;
+  segment->ackno = state->ackno;
+  segment->flags = flags;
+  segment->window = MAX_SEG_DATA_SIZE;
+  segment->cksum = 0;
+  memcpy(segment->data,data,len - SEGMENT_HDR_SIZE);
+  int32_t sum = cksum(segment,len);
+  segment->cksum = sum;
+  conn_send(state->conn,segment,len);
+  return 1;
+}
+
 
 
 ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
@@ -109,28 +120,12 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
   state->conn = conn;
   /* FIXME: Do any other initialization here. */
 
-  /* Init ctcp_config */
-  state->ctcp_config.recv_window = cfg->recv_window;
-  state->ctcp_config.send_window = cfg->send_window;
-  state->ctcp_config.timer = cfg->timer;
-  state->ctcp_config.rt_timeout = cfg->rt_timeout;
-
-  /*Init tx_state */
-  state->tx_state.last_ackno_rxed = 0;
-  state->tx_state.has_my_FIN_been_sent = false;
-  state->tx_state.has_my_FIN_been_acked = false;
-  state->tx_state.has_EOF_been_read = false;
-  state->tx_state.last_seqno_read = 0;
-  state->tx_state.last_seqno_sent = 0;
-  state->tx_state.timestamp_of_last_send = 0;
-  /* TODO: DON"T FORGET TO CALL LL_DESTROY()! */
-  state->tx_state.wrapped_unacked_segments = ll_create();
-
-  /*Init rx_state */
-  state->rx_state.last_seqno_accepted = 0;
-  state->rx_state.has_FIN_been_rxed = false;
-  /* TODO: DON"T FORGET TO CALL LL_DESTROY()! */
-  state->rx_state.segments_to_output = ll_create();
+  state->seqno = 1;
+  state->next_seqno = 0;
+  state->ackno = 1;
+  
+  /* Create a linked list of segment */
+  state->segments = ll_create();
 
   free(cfg);
   return state;
@@ -146,30 +141,7 @@ void ctcp_destroy(ctcp_state_t *state) {
 
   /* FIXME: Do any other cleanup here. */
 
-  /* Free everything in the list of unacknowledged segments. */
-  unsigned int len, i;
-  len = ll_length(state->tx_state.wrapped_unacked_segments);
-  if (len)
-    fprintf(stderr, "\n ** UH OH, %d segments were never acknowledged!\n", len);
-  for (i = 0; i < len; ++i)
-  {
-    ll_node_t *front_node_ptr = ll_front(state->tx_state.wrapped_unacked_segments);
-    free(front_node_ptr->object);
-    ll_remove(state->tx_state.wrapped_unacked_segments, front_node_ptr);
-  }
-  ll_destroy(state->tx_state.wrapped_unacked_segments);
-
-  /* Free everything in the list of segments to output. */
-  len = ll_length(state->rx_state.segments_to_output);
-  if (len)
-    fprintf(stderr, "\n *** UH OH, %d segments were never output!\n", len);
-  for (i = 0; i < len; ++i)
-  {
-    ll_node_t *front_node_ptr = ll_front(state->rx_state.segments_to_output);
-    free(front_node_ptr->object);
-    ll_remove(state->rx_state.segments_to_output, front_node_ptr);
-  }
-  ll_destroy(state->rx_state.segments_to_output);
+  
 
   free(state);
   end_client();
@@ -177,40 +149,21 @@ void ctcp_destroy(ctcp_state_t *state) {
 
 void ctcp_read(ctcp_state_t *state) {
   /* FIXME */
-  int bytes_read;
-  uint8_t buf[MAX_SEG_DATA_SIZE];
-  wrapped_ctcp_segment_t *new_segment_ptr;
+  uint32_t retval,len,flags = 0;
+  bzero(buffer,MAX_BUFF_SIZE);
+  retval = conn_input(state->conn, buffer, MAX_BUFF_SIZE);
 
-  while ((bytes_read = conn_input(state->conn, buf, MAX_SEG_DATA_SIZE)) > 0)
+  if (-1 == retval) 
   {
-    /* todo remove */
-    buf[bytes_read] = 0;
-    fprintf(stderr, "Read %d bytes: %s\n", bytes_read, buf);
-
-    /* create a new ctcp segment */
-    new_segment_ptr = (wrapped_ctcp_segment_t *)calloc(1,
-                                                       sizeof(wrapped_ctcp_segment_t) + bytes_read);
-    assert(new_segment_ptr != NULL);
-
-    /* Initialize the ctcp segment */
-    new_segment_ptr->num_xmits = 0;
-    new_segment_ptr->timestamp_of_last_send = 0;
-    new_segment_ptr->ctcp_segment.seqno = 0;
-
-    /* todo - initialize other members*/
-    /* DONT FORGET TO ALLOCATE DATA, AND FREE IT IN CTCP_DESTROY! */
-
-    /* Add new ctcp segment to our list of unacknowledged segments. */
-    ll_add(state->tx_state.wrapped_unacked_segments, new_segment_ptr);
-
-    /* TODO: At this point, I'm thinking there should be a utility function
-    ** called maybe 'update_state_and_send_segment()' which will take a
-    ** pointer to a segment (e.g., new_segment_ptr), and update state as well
-    ** as the ctcp_segment header stuff.
-    */
+    flags = FIN;
+    segment_send(state, flags, SEGMENT_HDR_SIZE, NULL);
+  }
+  else
+  {
+    len = retval + SEGMENT_HDR_SIZE;
+    segment_send(state, flags, len, buffer);
   }
 
-  /* TODO: handle the case when bytes_read == 1 */
 }
 
 void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
