@@ -308,7 +308,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
       if(DEBUG)
         fprintf(stderr,"Send FIN segment\n");
 /* Send FIN/ACK segment back */
-      if(_segment_send(state,FIN|ACK,SEGMENT_HDR_SIZE,NULL) < 0)
+      if(_segment_send(state,FIN,SEGMENT_HDR_SIZE,NULL) < 0)
       {
         perr("Cannot send FIN segment");
       }
