@@ -290,7 +290,7 @@ void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
 
   if (state->conn_state == DATA_TRANSFER)
   {
-    if(segment->ackno < state->seqno)
+    if((segment->ackno < state->seqno) || (segment->seqno < state->ackno))
     {
       goto exit_receive;
     }
