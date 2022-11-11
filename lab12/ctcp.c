@@ -15,29 +15,36 @@
 #include "ctcp_linked_list.h"
 #include "ctcp_sys.h"
 #include "ctcp_utils.h"
-#define DEBUG 1
+#define DEBUG 0
 #define MAX_BUFF_SIZE MAX_SEG_DATA_SIZE
 #define SEGMENT_HDR_SIZE sizeof(ctcp_segment_t)
 
-
-//char buffer_in[MAX_BUFF_SIZE];
-char buffer_out[MAX_BUFF_SIZE];
-
 enum conn_state {
   DATA_TRANSFER,
+  WAIT_TO_SEND_FIN,
   TEAR_DOWN,
   WAIT_LAST_ACK,
   WAIT_LAST_FIN,
-  RETRANSMITT,
+};
+
+enum keyword {
+  ACKNO,
+  SEQNO,
 };
 
 struct segment_attr {
-  uint16_t time;
+  uint16_t no_of_times;           /* Number of retransmission */
+  uint16_t time;                 /* Use for retransmission timeout counting */
+  uint16_t datalen;              /* Datalength of sent segment */
   ctcp_segment_t *segment;
 };
 
 typedef struct segment_attr ctcp_segment_attr_t;
 typedef enum conn_state conn_state_t;
+typedef enum keyword keyword_t;
+
+
+char buffer_out[MAX_BUFF_SIZE];
 
 
 /**
@@ -64,16 +71,23 @@ struct ctcp_state {
   
 
   /* FIXME: Add other needed fields. */
+  linked_list_t *segments_receive;
   conn_state_t conn_state;
-  uint32_t seqno;              /* Current sequence number */
-  uint32_t next_seqno;         /* Sequence number of next segment to send */
-  uint32_t ackno;              /* Current ack number */
-
-  ctcp_segment_t *received_segment;
-  ctcp_segment_attr_t *sent_segment_attr;
-  uint16_t tim;
+  uint32_t seqno;               /* Current sequence number */
+  uint32_t ackno;               /* Current ack number */
+  uint32_t base_seqno;          /* Base sequence number: seqno of the first segment in the send linked list */
+  uint16_t recv_window;         /* receiving window size */
+  uint16_t send_window;         /* sending window size */
+  
+  uint16_t datasize_in;         /* Size of data in the input window */
+  uint16_t datasize_out;        /* Size of data in the output window */
   uint16_t timer;               /* How often ctcp_timer() is called, in ms */
   uint16_t rt_timeout;          /* Retransmission timeout, in ms */
+  
+  bool     wait_destroy;        /* TRUE indicate starting 2*MSL timeout */
+  uint16_t tim;                 /* Use for 2*MSL timeout counting */
+  uint32_t fin_ackno;           /* ACK number of the first FIN segment */
+  uint32_t fin_seqno;           /* SEQ number of the first FIN segment */
 };
 
 /**
@@ -85,18 +99,9 @@ static ctcp_state_t *state_list;
 /* FIXME: Feel free to add as many helper functions as needed. Don't repeat
           code! Helper functions make the code clearer and cleaner. */
 
-static inline void perr(char* str)
-{
-  #ifdef DEBUG
-  fprintf(stderr,"Error: %s\n",str);
-  #endif
-}
-
-static inline void _print_segment_info(ctcp_segment_t *segment)
-{
-  fprintf(stderr,"   SeqNo: %x\n   AckNo: %x\n   len: %x\n   flags: %d\n   cksum: %d\n",segment->seqno,segment->ackno,segment->len,segment->flags,segment->cksum);
-}
-
+/**
+ * The two following funtions convert the byte-order of segments
+ */
 static void _segment_hton(ctcp_segment_t *segment)
 {
   segment->seqno = htonl(segment->seqno);
@@ -116,19 +121,65 @@ static void _segment_ntoh(ctcp_segment_t *segment)
   segment->window = ntohs(segment->window);
 }
 
-/*
-static void _save_sent_segment(linked_list_t *sent_segment_list, ctcp_segment_t *segment)
+/**
+ * Save the sent segment to a linked list of segments with attributes include:
+ *  timer counter, number of attempts, and segments' data length
+ */
+static void _save_sent_segment(ctcp_state_t *state, ctcp_segment_t *sent_segment)
 {
-  ctcp_segment_attr_t *segment_attr = calloc(sizeof(ctcp_segment_attr_t),1);
-  segment_attr->time = 0;
-  ll_add(sent_segment_list,(void *)segment_attr);
+  ctcp_segment_attr_t *sent_segment_attr;
+
+  sent_segment_attr = calloc(sizeof(ctcp_segment_attr_t),1);
+  sent_segment_attr->time = 0;
+  sent_segment_attr->no_of_times = 0;
+  sent_segment_attr->segment = sent_segment;
+  sent_segment_attr->datalen = ntohs(sent_segment->len) - SEGMENT_HDR_SIZE;
+
+  state->datasize_out += sent_segment_attr->datalen;
+  ll_add(state->segments_send,(void *)sent_segment_attr);
 }
-*/
-static void _save_sent_segment(ctcp_state_t *state, ctcp_segment_t *segment)
+
+/**
+ * Save received segment to linked list:
+ *  - Locate the received segment in the linked list.
+ *  - Add the received segment in the right position.
+ * 
+ * Received segment members are in host byte order
+ */
+static void _save_received_segment(ctcp_state_t *state, ctcp_segment_t *received_segment)
 {
-  state->sent_segment_attr = calloc(sizeof(ctcp_segment_attr_t),1);
-  state->sent_segment_attr->time = 0;
-  state->sent_segment_attr->segment = segment;
+  ctcp_segment_t *segment;
+  ll_node_t *ll_node;
+  uint32_t received_seqno;
+
+  ll_node = state->segments_receive->head;
+  received_seqno = received_segment->seqno;
+
+  while (NULL != ll_node)
+  {
+    segment = (ctcp_segment_t *)ll_node->object;
+
+    if (segment->seqno > received_seqno)
+      break;
+
+    ll_node = ll_node->next;
+  }
+
+  if (NULL == ll_node)
+  {
+    ll_add(state->segments_receive,received_segment);
+  }
+  else
+    if (ll_node == state->segments_receive->head)
+    {
+      ll_add_front(state->segments_receive,received_segment);
+    }
+  else
+  {
+    ll_add_after(state->segments_receive,ll_node->prev,received_segment);
+  }
+
+  state->datasize_in += received_segment->len - SEGMENT_HDR_SIZE;
 }
 
 static int16_t _segment_send(ctcp_state_t *state,int32_t flags, int32_t len, char* data)
