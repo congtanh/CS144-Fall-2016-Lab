@@ -188,13 +188,10 @@ static int16_t _segment_send(ctcp_state_t *state,int32_t flags, int32_t len, cha
   datalen = len - SEGMENT_HDR_SIZE;
   ctcp_segment_t *segment = calloc(len,1);
   segment->len = len;
-  if (flags&FIN){
-    state->seqno ++;
-  }
   segment->seqno = state->seqno;
   segment->ackno = state->ackno;
   segment->flags = flags;
-  segment->window = MAX_SEG_DATA_SIZE;
+  segment->window = state->recv_window;
   memcpy(segment->data,data,datalen);
   _segment_hton(segment);
   segment->cksum = 0;
@@ -204,17 +201,32 @@ static int16_t _segment_send(ctcp_state_t *state,int32_t flags, int32_t len, cha
   {
     return -1;
   }
-  fprintf(stderr,"Sent segment:\n");
-  _print_segment_info(segment);
-  fprintf(stderr,"\n");
-  state->seqno += datalen;
-  _save_sent_segment(state,segment);
+ 
+  if (flags & FIN)
+  {
+    state->seqno ++;
+    state->fin_seqno = state->seqno;
+    state->fin_ackno = state->ackno;
+  }
+  else
+  {
+    state->seqno += datalen;
+  }
+
+  if (datalen > 0)
+    _save_sent_segment(state,segment);
   return len;
 }
 
+/**
+ * Check if the segment is not corrupted or truncated.
+ * 
+ * Return  0  if the segment is valid
+ *        -1  if the segment is corrupted or truncated
+ */
 static int16_t _is_segment_valid(ctcp_segment_t *segment,uint16_t len)
 {
-  int32_t sum;
+  uint16_t sum;
   /* Check if segment is truncated */
   if(ntohs(segment->len) > len)
   { 
@@ -225,33 +237,183 @@ static int16_t _is_segment_valid(ctcp_segment_t *segment,uint16_t len)
   segment->cksum = 0;
   if(cksum(segment, ntohs(segment->len)) != sum)
   {
-    fprintf(stderr,"cksum failed %d %d\n",cksum(segment,segment->len),sum);
     return -1;
   }
-
-    return 0;
+  return 0;
 }
 
-
-static void _destroy_acked_segment(ctcp_state_t *state)
+/**
+ * Find a segment in a linked list of segment attributes base on the key
+ *   - ll_list: linked list of segment attributes (Ex: state->segment_send)
+ *   - key    : ACKNO or SEQNO
+ *   - number : ack number or sequence number of segment to find
+ * Return:    Pointer to ll_node of segment attributes matched with ackno or seqno to find
+ *            NULL if found no segment
+ */
+ll_node_t *_find_segment_ll_node(linked_list_t *ll_list,keyword_t key,uint32_t number)
 {
-  free(state->sent_segment_attr->segment);
-  free(state->sent_segment_attr);
-  state->sent_segment_attr = NULL;
-}
-
-void  retransmission_handler(ctcp_state_t *state)
-{
-  ctcp_segment_attr_t *segment_attr = state->sent_segment_attr;
-  if(segment_attr != NULL) {
-  segment_attr->time += state->timer;
-  if(segment_attr->time >= state->rt_timeout)
+  ll_node_t *ll_node;
+  ctcp_segment_attr_t *segment_attr;
+  ll_node = ll_list->head;
+  switch (key)
   {
-    conn_send(state->conn,segment_attr->segment,ntohs(segment_attr->segment->len));
+    case ACKNO:
+    {
+      while(NULL != ll_node)
+      {
+        segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+        
+        if(ntohl(segment_attr->segment->ackno) == number)
+          return ll_node;
+        else ll_node = ll_node->next;
+      }
+      break;
+    }
+    case SEQNO:
+    {
+      while(NULL != ll_node)
+      {
+        segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+        
+        if(ntohl(segment_attr->segment->seqno) == number)
+          return ll_node;
+        else ll_node = ll_node->next;
+      }
+      break;
+    }
   }
+  return NULL;
+}
+
+
+/**
+ * Destroy segment:
+ * Find the segment with ackno/seqno in segments_send linked list, free and nullify the segment but still hold
+ * segment's node in the linked list
+ * 
+ * Check from head and delete the nullified segments.
+ * 
+ *  state : state structure
+ *  key   : ACKNO or SEQNO
+ *  number: ack or sequence number of the segment to be destroy
+ * 
+ *  return: number of removed linked list node (0 if the destroyed segment is not at the head of the linked list)
+**/
+static int _destroy_segment_attr(ctcp_state_t *state,keyword_t key, uint32_t number)
+{
+  int ret = 0;
+  ll_node_t *ll_node;
+  ctcp_segment_attr_t *sent_segment_attr;
+  
+  ll_node = _find_segment_ll_node(state->segments_send,key,number);
+  if (NULL == ll_node)
+  {
+    return ret;
+  }
+  sent_segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+  free(sent_segment_attr->segment);
+  sent_segment_attr->segment = NULL;
+
+  ll_node = state->segments_send->head;
+  sent_segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+  while(NULL == sent_segment_attr->segment)
+  {
+    state->datasize_out -= sent_segment_attr->datalen;
+    free(sent_segment_attr);
+    ll_remove(state->segments_send,ll_node);
+
+    ret++;
+
+    ll_node = state->segments_send->head;
+    if (NULL == ll_node)
+      break;
+    sent_segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+  }
+
+  ll_node = state->segments_send->head;
+  if (NULL != ll_node)
+  {
+    sent_segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+    state->base_seqno = sent_segment_attr->segment->seqno;
+  }
+
+  return ret;
+}
+
+/**
+ * Destroy the linked list of sent segments
+ * Because the segments are wrapped in the struct segment_attr, segments must be freed 
+ * before the segment_attr structs are freed
+ */
+static void _destroy_ll_sent_segments(ctcp_state_t *state)
+{
+  ll_node_t *ll_node;
+  ctcp_segment_attr_t *segment_attr;
+  
+  ll_node = state->segments_send->head;
+
+  while (NULL != ll_node)
+  {
+    segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+    free(segment_attr->segment);
+    segment_attr->segment = NULL;
+  }
+
+  ll_destroy(state->segments_send);
+}
+
+/**
+ * Timer handler for each connection state
+ */
+void timer_handler(ctcp_state_t *state)
+{
+
+  if (state->wait_destroy == 1)
+  {
+    state->tim += state->timer;
+      if(state->tim >= (state->rt_timeout)*50)
+      {
+        ctcp_destroy(state);
+        return;
+      }
+  }
+
+  ll_node_t *ll_node;
+  ctcp_segment_attr_t *segment_attr;
+  ll_node = state->segments_send->head;
+  while(ll_node != NULL) 
+  {
+    segment_attr = (ctcp_segment_attr_t *)ll_node->object;
+    segment_attr->time += state->timer;
+    if(segment_attr->time >= state->rt_timeout)
+    {
+      conn_send(state->conn,segment_attr->segment,ntohs(segment_attr->segment->len));
+      segment_attr->no_of_times ++;
+      segment_attr->time = 0;
+      if(segment_attr->no_of_times >= 5)
+      {
+        ctcp_destroy(state);
+        break;
+      }
+      else
+      {
+        ll_node = ll_node->next;
+      }
+
+      if ((state->conn_state == WAIT_TO_SEND_FIN) && (state->segments_send->length == 0))
+      {
+        state->conn_state = WAIT_LAST_ACK;
+      }
+    }
+    else
+    {
+      ll_node = ll_node->next;
+    }
   }
 }
-ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
+
+ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg)
+{
   /* Connection could not be established. */
   if (conn == NULL) {
     return NULL;
@@ -272,19 +434,29 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 
   state->ackno = 1;
   state->seqno = 1;
+  state->base_seqno = 1;
+
+  state->recv_window = cfg->recv_window;
+  state->send_window = cfg->send_window;
+  state->datasize_in = 0;
+  state->datasize_out = 0;
+
   state->tim = 0;
   state->timer = cfg->timer;
   state->rt_timeout = cfg->rt_timeout;
+
   state->conn_state = DATA_TRANSFER;
-  
-  /* Create a linked list of segment */
+  state->wait_destroy = 0;
+
   state->segments_send = ll_create();
+  state->segments_receive = ll_create();
 
   free(cfg);
   return state;
 }
 
-void ctcp_destroy(ctcp_state_t *state) {
+void ctcp_destroy(ctcp_state_t *state)
+{
   /* Update linked list. */
   if (state->next)
     state->next->prev = state->prev;
@@ -293,10 +465,13 @@ void ctcp_destroy(ctcp_state_t *state) {
   conn_remove(state->conn);
 
   /* FIXME: Do any other cleanup here. */
-  ll_destroy(state->segments_send);
-  
 
+  _destroy_ll_sent_segments(state);
+  ll_destroy(state->segments_receive);
+  
   free(state);
+
+  state = NULL;
   end_client();
 }
 
