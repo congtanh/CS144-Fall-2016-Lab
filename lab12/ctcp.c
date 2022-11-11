@@ -165,14 +165,14 @@ static int16_t _is_segment_valid(ctcp_segment_t *segment,uint16_t len)
 {
   int32_t sum;
   /* Check if segment is truncated */
-  if(segment->len > len)
+  if(ntohs(segment->len) > len)
   { 
     return -1;
   }
   /* Check if segment is corrupted */
   sum = segment->cksum;
   segment->cksum = 0;
-  if(cksum(segment, segment->len) != sum)
+  if(cksum(segment, ntohs(segment->len)) != sum)
   {
     fprintf(stderr,"cksum failed %d %d\n",cksum(segment,segment->len),sum);
     return -1;
