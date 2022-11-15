@@ -2,3 +2,6 @@
 *.pyo
 *.pyc
 /solution/*
+*.d
+*.o
+/router/sr
